@@ -1,6 +1,8 @@
+#!/usr/
 import sys
 import struct
 from mpmath import *
+from bisect import bisect
 
 def rawbytes(s):
     outlist = []
@@ -28,33 +30,65 @@ def getModel(chars_count, len_text):
     model.fromkeys(chars_count)
     for ch in chars_count.keys():
         width = chars_count[ch]/len_text
-        model[ch] = (start, width)
+        model[ch] = width
         start += chars_count[ch]/len_text
     return model
 
 def encode(plain_text):
-    model = getModel(getCharscount(plain_text), len(plain_text))
-    len_text = len(plain_text)
-    mp.dps = len_text * len_text
-    high = mpf(1.0)
-    low = mpf(0.0)
-    for ch in plain_text:
-        ch_start, ch_width = model[ch]
-        ch_end = ch_start + ch_width
-        delta = mpf(high - low)
-        high = low + (ch_end * delta)
-        low = low + (ch_start * delta)
-    result = ['0', '.']
-    k = 2
-    value = floattobinary("".join(result))
-    while(value < low):
-        result.append('1')
-        value = floattobinary("".join(result))
-        if (value > high):
-            result[k] = '0'
-        value = floattobinary("".join(result))
-        k += 1
-    return result[2:]
+    precision = 32
+    one = int(2 ** precision - 1)
+    quarter = int(ceil(one / 4))
+    half = 2 * quarter
+    threequarters = 3 * quarter
+
+    chars_count = getCharscount(plain_text)
+    model = getModel(chars_count, len(plain_text))
+
+    f = [0.0]
+    for a in model:
+        f.append(f[-1] + model[a])
+    f.pop()
+    f = dict([(a, mf) for a, mf in zip(model, f)])
+
+    res = []
+    low, hight = 0, one
+    straddle = 0
+
+    for k in range(0, len(plain_text)):
+        lohi_range = hight - low + 1
+
+        low = low + ceil(lohi_range * f[plain_text[k]])
+        hight = low + floor(lohi_range * model[plain_text[k]])
+
+        while True:
+            if hight < half:
+                res.append(0)
+                res.extend([1 for i in range(straddle)])
+                straddle = 0
+            elif low >= half:
+                res.append(1)
+                res.extend([0 for i in range(straddle)])
+                straddle = 0
+                low -= half
+                hight -= half
+            elif low >= quarter and hight < threequarters:
+                straddle += 1
+                low -= quarter
+                hight -= quarter
+            else:
+                break
+            low = 2 * low
+            hight = 2 * hight + 1
+
+    straddle += 1
+    if low < quarter:
+        res.append(0)
+        res.extend([1 for i in range(straddle)])
+    else:
+        res.append(1)
+        res.extend([0 for i in range(straddle)])
+
+    return res
 
 def write_header(file, dict_chars, len_text):
     file.write(len_text.to_bytes(4, byteorder='little'))
@@ -64,10 +98,8 @@ def write_header(file, dict_chars, len_text):
         file.write(letter.to_bytes(1, byteorder='little'))
         file.write(code.to_bytes(4, byteorder='little'))
 
-def write_delta(file, delta):
-    pass
-
 def write_text(file, enc):
+    enc = [str(i) for i in enc]
     enc = ''.join(enc)
     res = pad_encoded_text(enc)
     res = get_byte_array(res)
@@ -79,25 +111,65 @@ def enc_handler(inpath, outpath):
     f.close()
     f = open(outpath, 'wb')
     enc = encode(con)
+    print(enc)
     write_header(f, getCharscount(con), len(con))
     write_text(f, enc)
 
 def decode(enc_num, model, len_text):
-    string = []
-    enc_num = mpf(enc_num)
-    high = mpf(1.0)
-    low = mpf(0.0)
-    d_range = mpf(high - low)
-    while (len(string) < len_text):
-        for c, (c_low, c_width) in model.items():
-            c_high = mpf(c_low + c_width)
-            d_range = mpf(high - low)
-            if c_low <= (enc_num - low)/d_range < c_high:
-                high = mpf(low + (d_range * c_high))
-                low = mpf(low + (d_range * c_low))
-                string.append(c)
-    string = string[:len_text]
-    return ''.join(string)
+    precision = 32
+    one = int(2 ** precision - 1)
+    quarter = int(ceil(one / 4))
+    half = 2 * quarter
+    threequarters = 3 * quarter
+
+    alphabet = list(model)
+    f = [0]
+    for a in model:
+        f.append(f[-1] + model[a])
+    f.pop()
+
+    model = list(model.values())
+
+    enc_num.extend(precision * [0]) 
+    res = len_text * [0]  
+
+    value = int(''.join(str(a) for a in enc_num[0:precision]), 2)
+    y_position = precision  
+    low, hight = 0, one
+
+    res_position = 0
+    while 1:
+        lohi_range = hight - low + 1
+        a = bisect(f, (value - low) / lohi_range) - 1
+        res[res_position] = alphabet[a]
+
+        low = low + int(ceil(f[a] * lohi_range))
+        hight = low + int(floor(model[a] * lohi_range))
+
+        while True:
+            if hight < half:
+                pass
+            elif low >= half:
+                low = low - half
+                hight = hight - half
+                value = value - half
+            elif low >= quarter and hight < threequarters:
+                low = low - quarter
+                hight = hight - quarter
+                value = value - quarter
+            else:
+                break
+            low = 2 * low
+            hight = 2 * hight + 1
+            value = 2 * value + enc_num[y_position]
+            y_position += 1
+            if y_position == len(enc_num)+1:
+                break
+
+        res_position += 1
+        if res_position == len_text or y_position == len(enc_num)+1:
+            break
+    return bytes(res)
 
 def parse_header(input):
     len_text = int.from_bytes(input[0:4], byteorder='little')
@@ -105,7 +177,7 @@ def parse_header(input):
     header = input[5:5*col_letters + 5]
     dict_chars = dict()
     for i in range(col_letters):
-        dict_chars[chr(header[i*5])] = int.from_bytes(header[i*5+1:i*5+5], byteorder='little')
+        dict_chars[header[i*5]] = int.from_bytes(header[i*5+1:i*5+5], byteorder='little')
     return (dict_chars, len_text)
 
 def parse_text(input):
@@ -124,9 +196,10 @@ def dec_handler(inpath, outpath):
     enc_text = parse_text(con)
     enc_pad = to_binary(enc_text)
     enc = remove_padding(enc_pad)
-    enc_num = floattobinary('0.' + enc)
-    dec = decode(enc_num, model, len_text)
-    f.write(rawbytes(dec))
+    enc = [int(i) for i in enc]
+    dec = decode(enc, model, len_text)
+    f.write(dec)
+    f.close()
 
 def floattobinary(value):
     result = mpf(0.0)
